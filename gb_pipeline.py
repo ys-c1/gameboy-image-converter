@@ -9,6 +9,7 @@ breakdown these functions implement.
 
 import heapq
 import threading
+import time
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -1879,4 +1880,382 @@ def convert_for_hardware(
         stats=stats,
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layered two-palette composite (background 4-colour set + sprite 4-colour set)
+# ---------------------------------------------------------------------------
+#
+# Game Boy Color hardware gives the background layer and the object (sprite)
+# layer *separate* 4-colour palettes. This module models that split directly,
+# in three explicit stages, without touching the single-image pipeline above:
+#
+#   1. fit/quantize  -- each layer takes its own four-colour palette (either
+#      caller-supplied or fitted from that layer's pixels in CIELAB); every
+#      layer pixel maps to the nearest of its own four entries.
+#   2. composite     -- per pixel, the winning layer is chosen by hardware
+#      priority plus the sprite's alpha. Sprites also support GB's colour-0
+#      transparent slot. Partial alpha blends the two quantized layer colours.
+#   3. budget        -- the frame's distinct colours must stay inside a total
+#      budget (hardware ceiling 8 = 4 + 4). Overflow is resolved by repeatedly
+#      merging the perceptually closest pair (smallest CIELAB dE), never by
+#      silent truncation; when the closest pair already exceeds the caller's
+#      merge threshold, LayerColorBudgetError is raised instead.
+#
+# Nothing in this section is imported by convert_for_hardware, so the existing
+# single-palette / mono output paths stay byte-for-byte unchanged.
+
+# Hardware ceiling for the two-layer split: two 4-colour palettes.
+LAYER_HARDWARE_COLOR_BUDGET = 8
+
+# Sprite OBJ palettes cannot use colour slot 0 as an opaque colour on real
+# hardware (it is the transparent slot); kept here as a module constant so the
+# rule is explicit even though callers may override per-pixel with alpha.
+SPRITE_TRANSPARENT_SLOT = 0
+
+
+class LayerColorBudgetError(RuntimeError):
+    """Raised when the layered frame exceeds its colour budget and the closest
+    available merge pair is farther apart in CIELAB than the configured
+    threshold. The overflow is reported as data instead of being silently
+    truncated."""
+
+
+@dataclass
+class LayerCompositeResult:
+    """Outcome of :func:`composite_layers` -- the composited frame plus every
+    measurement the three-stage contract requires."""
+
+    image: np.ndarray
+    # (H, W, 3) uint8 final frame, after quantize -> composite -> budget merge.
+    bg_palette: np.ndarray            # (4, 3) uint8, RGB555, luminance-sorted
+    sprite_palette: np.ndarray        # (4, 3) uint8, RGB555, luminance-sorted
+    effective_palette: np.ndarray     # (k<=budget, 3) uint8 distinct frame colours
+    bg_index: np.ndarray              # (H, W) int8 index into bg_palette, per pixel
+    sprite_index: np.ndarray          # (H, W) int8 index into sprite_palette, per pixel
+    winner: np.ndarray                # (H, W) uint8: 0=background, 1=sprite, 2=blend
+    overlap_mask: np.ndarray          # (H, W) bool: sprite present (alpha > 0)
+    priority: str                     # the priority order actually applied
+    n_colors_pre_merge: int           # distinct frame colours before budget merges
+    n_colors: int                     # distinct frame colours after budget merges
+    n_merges: int                     # number of colour pairs merged
+    bg_delta_e: float                 # mean per-pixel CIELAB dE, background quantize
+    sprite_delta_e: float             # mean per-pixel CIELAB dE, sprite quantize (opaque px)
+    overlap_pixels: int               # size of the overlap region
+    overlap_mismatch: int             # overlap pixels whose colour differs across the
+                                      # two priority orders (counter-example evidence)
+    merge_loss: float                 # mean per-pixel CIELAB dE introduced by merges
+    merge_p95_delta_e: float          # p95 per-pixel CIELAB dE introduced by merges
+    merge_records: list               # list[(color_a, color_b, merged, dE, pixels)]
+    timing: dict                      # stage -> seconds (perf_counter)
+
+
+def _coerce_layer_palette(palette: np.ndarray | None, pixels: np.ndarray,
+                          mask: np.ndarray) -> np.ndarray:
+    """Return a canonical (4, 3) RGB555, luminance-sorted layer palette.
+
+    A caller-supplied palette is validated (1-4 colours), snapped to RGB555 and
+    padded to four entries (duplicate slots are legal, matching the hardware's
+    fixed four slots). With ``palette=None`` the four colours are fitted from
+    the layer's own masked pixels with the same deterministic weighted
+    4-means-in-Lab path as :func:`pack_palettes`, then snapped/sorted.
+    """
+    if palette is not None:
+        pal = np.asarray(palette, dtype=np.uint8).reshape(-1, 3)
+        if not 1 <= len(pal) <= 4:
+            raise ValueError("a layer palette must hold between 1 and 4 colours")
+        return luminance_sort(snap_rgb555(_pad4(pal))).astype(np.uint8)
+
+    sel = pixels[mask].reshape(-1, 3)
+    if sel.shape[0] == 0:
+        raise ValueError("cannot fit a layer palette from an empty layer")
+    uniq, inv = np.unique(sel, axis=0, return_inverse=True)
+    counts = np.bincount(inv, minlength=len(uniq)).astype(np.float64)
+    if len(uniq) <= 4:
+        centers_lab = _rgb_to_lab(uniq)
+    else:
+        centers_lab = _weighted_kmeans_lab(_rgb_to_lab(uniq), counts, 4)
+    pal = _lab_to_rgb_u8(centers_lab)
+    return luminance_sort(snap_rgb555(_pad4(pal))).astype(np.uint8)
+
+
+def _quantize_to_palette(pixels: np.ndarray, palette: np.ndarray,
+                         mask: np.ndarray) -> tuple:
+    """Map masked pixels to their nearest palette entry in CIELAB.
+
+    Returns ``(index_image (H,W) int8 filled with -1 outside the mask,
+    quantized_rgb (H,W,3) uint8, mean_delta_e over masked pixels)``.
+    """
+    h, w = pixels.shape[:2]
+    index = np.full((h, w), -1, dtype=np.int8)
+    quant = np.zeros((h, w, 3), dtype=np.uint8)
+    if not mask.any():
+        return index, quant, 0.0
+    sel = pixels[mask].reshape(-1, 3)
+    uniq, inv = np.unique(sel, axis=0, return_inverse=True)
+    pal_lab = _rgb_to_lab(palette)
+    nearest = _nearest_indices(_rgb_to_lab(uniq), pal_lab)  # per unique colour
+    # Per-pixel CIELAB distance actually paid by the quantization.
+    u_lab = _rgb_to_lab(uniq)
+    d2 = np.sum((u_lab - pal_lab[nearest]) ** 2, axis=1)
+    delta_e = np.sqrt(d2)
+    mean_de = float((delta_e[inv]).mean())
+    idx_flat = nearest[inv]
+    index[mask] = idx_flat.astype(np.int8)
+    quant[mask] = palette[idx_flat]
+    return index, quant, mean_de
+
+
+def _enforce_color_budget(frame: np.ndarray, budget: int,
+                          merge_threshold: float) -> tuple:
+    """Drive a frame's distinct colours down to ``<= budget`` by merging the
+    perceptually closest pair each round.
+
+    The pair picked is the two distinct frame colours with the smallest
+    Euclidean CIELAB distance (the task's "perceptual colour difference");
+    ties resolve on the sorted colour tuple so the run is deterministic. The
+    replacement is their pixel-count-weighted Lab centroid, snapped to RGB555.
+    If the closest pair's dE already exceeds ``merge_threshold`` no legal
+    merge remains and :class:`LayerColorBudgetError` is raised -- colours are
+    never dropped or truncated to make the budget.
+
+    Returns ``(new_frame, merge_records, per_pixel_loss, p95_loss)`` where each
+    record is ``(color_a, color_b, merged_color, dE, affected_pixels)`` and the
+    losses are CIELAB dE measured per affected pixel.
+    """
+    budget = max(1, int(budget))
+    work = frame.copy()
+    flat = work.reshape(-1, 3)
+    uniq, inv = np.unique(flat, axis=0, return_inverse=True)
+    inv = inv.reshape(-1)
+    records: list = []
+    loss_records: list = []  # (per_pixel_dE array, weight)
+
+    while len(uniq) > budget:
+        lab = _rgb_to_lab(uniq)
+        diff = lab[:, None, :] - lab[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        np.fill_diagonal(d2, np.inf)
+        # Closest pair; argmin on the row-major flattening breaks ties on the
+        # ordered (a, b) colour indices, so equal-distance pairs resolve
+        # deterministically without a full sort.
+        ai, bi = np.unravel_index(int(np.argmin(d2)), d2.shape)
+        pair_de = float(np.sqrt(d2[ai, bi]))
+        if pair_de > float(merge_threshold):
+            raise LayerColorBudgetError(
+                f"layered frame needs {len(uniq)} distinct colours but the "
+                f"budget is {budget}; the closest merge pair is "
+                f"{tuple(int(v) for v in uniq[ai])} <-> "
+                f"{tuple(int(v) for v in uniq[bi])} at dE={pair_de:.2f}, "
+                f"which exceeds the configured merge threshold "
+                f"{float(merge_threshold):.2f} -- refusing to truncate colours"
+            )
+        counts = np.bincount(inv, minlength=len(uniq)).astype(np.float64)
+        centroid = (lab[ai] * counts[ai] + lab[bi] * counts[bi]) / (
+            counts[ai] + counts[bi]
+        )
+        merged = snap_rgb555(_lab_to_rgb_u8(centroid[None, :]))[0]
+
+        # Per-pixel loss paid by every pixel recoloured by this merge.
+        merged_lab = _rgb_to_lab(merged[None, :])[0]
+        affected_mask = (inv == ai) | (inv == bi)
+        old_lab = lab[inv[affected_mask]]
+        px_de = np.sqrt(np.sum((old_lab - merged_lab) ** 2, axis=1))
+        loss_records.append((px_de, int(affected_mask.sum())))
+        records.append(
+            (uniq[ai].copy(), uniq[bi].copy(), merged.copy(),
+             pair_de, int(affected_mask.sum()))
+        )
+
+        # Rewrite both colours everywhere (frame + inverse mapping), then
+        # re-derive the distinct set so an accidental centroid collision
+        # collapses cleanly.
+        for old in (uniq[ai], uniq[bi]):
+            work[np.all(work == old, axis=2)] = merged
+        flat = work.reshape(-1, 3)
+        uniq, inv = np.unique(flat, axis=0, return_inverse=True)
+        inv = inv.reshape(-1)
+
+    if loss_records:
+        all_de = np.concatenate([d for d, _ in loss_records])
+        all_w = np.concatenate(
+            [np.full(len(d), w, dtype=np.float64) for d, w in loss_records]
+        )
+        mean_loss = float((all_de * all_w).sum() / all_w.sum())
+        p95_loss = _weighted_percentile(all_de, all_w, 95.0)
+    else:
+        mean_loss, p95_loss = 0.0, 0.0
+    return work, records, mean_loss, p95_loss
+
+
+def composite_layers(
+    background: np.ndarray,
+    sprite: np.ndarray,
+    *,
+    bg_palette: np.ndarray | None = None,
+    sprite_palette: np.ndarray | None = None,
+    priority: str = "sprite_first",
+    alpha_threshold: float = 0.5,
+    color_budget: int = LAYER_HARDWARE_COLOR_BUDGET,
+    merge_threshold: float = 25.0,
+    sprite_transparent_index: int | None = None,
+) -> LayerCompositeResult:
+    """Three-stage two-palette composite of a background and a sprite layer.
+
+    Parameters
+    ----------
+    background:
+        ``(H, W, 3)`` uint8 RGB background layer (fully opaque).
+    sprite:
+        ``(H, W, 3)`` or ``(H, W, 4)`` uint8 sprite layer. With four channels
+        the last channel is alpha (0-255); an RGB sprite is treated as fully
+        opaque. Layers must share their spatial shape.
+    bg_palette, sprite_palette:
+        Optional explicit 1-4 colour palettes (RGB). When omitted, each layer's
+        four colours are fitted from its own pixels (deterministic weighted
+        4-means in CIELAB). Both are returned canonicalized to RGB555,
+        luminance-sorted, padded to four slots.
+    priority:
+        ``"sprite_first"`` (hardware default: OBJ wins an opaque overlap) or
+        ``"background_first"`` (the deliberately reversed order, used to
+        produce the order-counter-example).
+    alpha_threshold:
+        Fractional alpha at/above which a sprite pixel is treated as opaque;
+        below it the background shows through. Mid-range alpha (strictly
+        between 0 and 1) alpha-blends the two *quantized* layer colours.
+    color_budget:
+        Maximum distinct colours allowed in the output frame. Clamped to the
+        hardware ceiling of 8 (two 4-colour palettes).
+    merge_threshold:
+        Maximum CIELAB dE a closest-pair merge is allowed to cost. A frame that
+        still overflows with every remaining pair above this threshold raises
+        :class:`LayerColorBudgetError` instead of truncating.
+    sprite_transparent_index:
+        When set (typically 0), sprite pixels quantized to this palette slot
+        are treated as fully transparent regardless of alpha -- the GB OBJ
+        colour-0 rule.
+    """
+    if priority not in ("sprite_first", "background_first"):
+        raise ValueError(
+            f"unknown layer priority {priority!r}; expected 'sprite_first' "
+            "or 'background_first'"
+        )
+    bg = np.asarray(background, dtype=np.uint8)
+    sp = np.asarray(sprite, dtype=np.uint8)
+    if bg.ndim != 3 or bg.shape[2] != 3:
+        raise ValueError("background must be an (H, W, 3) RGB array")
+    if sp.ndim != 3 or sp.shape[2] not in (3, 4):
+        raise ValueError("sprite must be (H, W, 3) RGB or (H, W, 4) RGBA")
+    if sp.shape[:2] != bg.shape[:2]:
+        raise ValueError("background and sprite must share their spatial shape")
+    h, w = bg.shape[:2]
+    timing: dict = {}
+
+    sprite_rgb = sp[:, :, :3]
+    if sp.ndim == 3 and sp.shape[2] == 4:
+        alpha = sp[:, :, 3].astype(np.float64) / 255.0
+    else:
+        alpha = np.ones((h, w), dtype=np.float64)
+
+    # --- Stage 1: per-layer four-colour quantize ----------------------------
+    t0 = time.perf_counter()
+    bg_mask = np.ones((h, w), dtype=bool)
+    bg_pal = _coerce_layer_palette(bg_palette, bg, bg_mask)
+    bg_idx, bg_quant, bg_de = _quantize_to_palette(bg, bg_pal, bg_mask)
+
+    sprite_present = alpha > 0.0
+    sp_pal = _coerce_layer_palette(sprite_palette, sprite_rgb, sprite_present)
+    sp_idx, sp_quant, sp_de = _quantize_to_palette(
+        sprite_rgb, sp_pal, sprite_present
+    )
+    timing["quantize_s"] = time.perf_counter() - t0
+
+    # Hardware OBJ colour-0 transparency: a flagged slot never wins a pixel.
+    transparent = np.zeros((h, w), dtype=bool)
+    if sprite_transparent_index is not None:
+        if not 0 <= int(sprite_transparent_index) < 4:
+            raise ValueError("sprite_transparent_index must be a slot 0-3")
+        transparent = sprite_present & (sp_idx == int(sprite_transparent_index))
+        sprite_present = sprite_present & ~transparent
+
+    # --- Stage 2: priority + alpha composite --------------------------------
+    t0 = time.perf_counter()
+    overlap_mask = sprite_present.copy()
+    opaque = alpha >= float(alpha_threshold)
+    # A transparent-slot or zero-alpha pixel can never be opaque.
+    opaque = opaque & sprite_present
+    partial = sprite_present & ~opaque & (alpha > 0.0)
+
+    frame = bg_quant.copy()
+    winner = np.zeros((h, w), dtype=np.uint8)  # default: background
+
+    if priority == "sprite_first":
+        frame[opaque] = sp_quant[opaque]
+        winner[opaque] = 1
+    else:  # background_first: an opaque overlap keeps the background colour.
+        # winner stays 0 on the opaque overlap -- the visible counter-example.
+        pass
+
+    if partial.any():
+        a = np.clip(alpha[partial], 0.0, 1.0)[:, None]
+        blended = np.round(
+            sp_quant[partial].astype(np.float64) * a
+            + bg_quant[partial].astype(np.float64) * (1.0 - a)
+        )
+        frame[partial] = blended.astype(np.uint8)
+        winner[partial] = 2
+    timing["composite_s"] = time.perf_counter() - t0
+
+    # Counter-example evidence: render the *other* priority and count overlap
+    # pixels whose colour changes. Partial-alpha blends are order-independent,
+    # so only opaque-overlap pixels can disagree -- exactly the pixels where
+    # getting the priority backwards shows up visually.
+    reversed_frame = bg_quant.copy()
+    if priority == "sprite_first":
+        reversed_frame[opaque] = bg_quant[opaque]  # background wins instead
+    else:
+        reversed_frame[opaque] = sp_quant[opaque]
+    reversed_frame[partial] = frame[partial]
+    mismatch = int(
+        np.count_nonzero(
+            np.any(frame[overlap_mask] != reversed_frame[overlap_mask], axis=1)
+        )
+    )
+
+    # --- Stage 3: total colour budget with perceptual closest-pair merge -----
+    t0 = time.perf_counter()
+    n_pre = int(np.unique(frame.reshape(-1, 3), axis=0).shape[0])
+    budget = min(int(color_budget), LAYER_HARDWARE_COLOR_BUDGET)
+    if budget < 1:
+        raise ValueError("color_budget must be >= 1")
+    frame, records, merge_loss, p95_loss = _enforce_color_budget(
+        frame, budget, merge_threshold
+    )
+    timing["budget_merge_s"] = time.perf_counter() - t0
+    timing["total_s"] = float(sum(timing.values()))
+
+    effective = np.unique(frame.reshape(-1, 3), axis=0)
+
+    return LayerCompositeResult(
+        image=frame,
+        bg_palette=bg_pal,
+        sprite_palette=sp_pal,
+        effective_palette=effective.astype(np.uint8),
+        bg_index=bg_idx,
+        sprite_index=sp_idx,
+        winner=winner,
+        overlap_mask=overlap_mask,
+        priority=priority,
+        n_colors_pre_merge=n_pre,
+        n_colors=int(len(effective)),
+        n_merges=len(records),
+        bg_delta_e=bg_de,
+        sprite_delta_e=sp_de,
+        overlap_pixels=int(overlap_mask.sum()),
+        overlap_mismatch=mismatch,
+        merge_loss=merge_loss,
+        merge_p95_delta_e=p95_loss,
+        merge_records=records,
+        timing=timing,
     )
