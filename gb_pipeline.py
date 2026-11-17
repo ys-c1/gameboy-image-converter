@@ -145,6 +145,247 @@ def pattern_variants(pattern: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tile byte packing -- cartridge-ready 1bpp / 2bpp data
+# ---------------------------------------------------------------------------
+#
+# ``pattern_to_2bpp`` above is the fixed GB hardware format used internally
+# for tile identity. The functions below are the export path: they pack whole
+# tilesets and expose the two layout choices that differ between GB tooling
+# and third-party formats:
+#
+#   bit_order    "msb" (GB hardware: leftmost pixel = bit 7) or "lsb"
+#   interleaved  True  -> GB hardware order, per row [low plane, high plane]
+#                False -> planar order, all 8 low-plane rows then all 8 high
+#
+# 1bpp tiles are 8 bytes each (one byte per row); 2bpp tiles are 16 bytes.
+# A palette swap is a permutation applied to the 2-bit indices, so the same
+# tile bytes can be decoded through a different palette (the classic GB
+# palette-swap trick) without touching the packed data.
+
+_GB_BIT_ORDERS = ("msb", "lsb")
+
+
+def _validate_bit_order(bit_order: str) -> str:
+    if bit_order not in _GB_BIT_ORDERS:
+        raise ValueError(
+            f"bit_order must be one of {_GB_BIT_ORDERS}, got {bit_order!r}"
+        )
+    return bit_order
+
+
+def _as_index_patterns(patterns, max_index: int, what: str = "patterns") -> np.ndarray:
+    """Validate an (n, 8, 8) integer index array and return it as uint8.
+
+    Raises ``TypeError`` for non-integer input and ``ValueError`` for a wrong
+    shape or any index outside ``0..max_index`` -- packing must never silently
+    truncate an out-of-range index with ``& 3``.
+    """
+    arr = np.asarray(patterns)
+    if arr.ndim != 3 or arr.shape[1:] != (8, 8):
+        raise ValueError(f"{what} must have shape (n, 8, 8), got {arr.shape}")
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f"{what} must contain integer indices, got {arr.dtype}")
+    if arr.size:
+        lo = int(arr.min())
+        hi = int(arr.max())
+        if lo < 0 or hi > max_index:
+            raise ValueError(
+                f"{what} indices must be in 0..{max_index}; "
+                f"got min={lo}, max={hi}"
+            )
+    return arr.astype(np.uint8, copy=False)
+
+
+def _validate_palette_swap(palette_swap, n_colors: int) -> np.ndarray | None:
+    """Validate a palette-index permutation of length ``n_colors``."""
+    if palette_swap is None:
+        return None
+    swap = np.asarray(palette_swap)
+    if swap.ndim != 1 or swap.shape[0] != n_colors:
+        raise ValueError(
+            f"palette_swap must be a permutation of length {n_colors}, "
+            f"got shape {swap.shape}"
+        )
+    if not np.issubdtype(swap.dtype, np.integer):
+        raise TypeError(f"palette_swap must contain integers, got {swap.dtype}")
+    if sorted(int(v) for v in swap) != list(range(n_colors)):
+        raise ValueError(
+            f"palette_swap must be a permutation of 0..{n_colors - 1}, "
+            f"got {swap.tolist()}"
+        )
+    return swap.astype(np.uint8)
+
+
+def _apply_palette_swap(
+    indices: np.ndarray, palette_swap, n_colors: int, *, inverse: bool = False
+) -> np.ndarray:
+    """Relabel indices through a palette permutation.
+
+    ``palette_swap[i]`` is the logical/palette entry that a *stored* index
+    ``i`` displays as. Decoding therefore gathers ``swap[stored]``; packing
+    gathers the inverse (``inverse=True``) so the stored byte decodes back to
+    the original index under that same swap.
+    """
+    swap = _validate_palette_swap(palette_swap, n_colors)
+    if swap is None:
+        return indices
+    if inverse:
+        swap = np.argsort(swap, kind="stable").astype(np.uint8)
+    return swap[indices]
+
+
+def pack_tiles_2bpp(
+    patterns,
+    *,
+    bit_order: str = "msb",
+    interleaved: bool = True,
+    palette_swap=None,
+) -> bytes:
+    """Pack (n, 8, 8) 2-bit indices into ``16 * n`` GB tile bytes.
+
+    The default is the GB hardware layout: for each row, the low bit-plane
+    byte followed by the high bit-plane byte, leftmost pixel at bit 7. Set
+    ``bit_order="lsb"`` for leftmost-pixel-at-bit-0, and ``interleaved=False``
+    for planar layout (rows 0-7 low plane, then rows 0-7 high plane).
+
+    ``palette_swap`` optionally stores the tiles under a permuted palette: a
+    length-4 permutation where ``palette_swap[stored]`` is the logical index
+    that stored value displays as. Packing applies its inverse, so unpacking
+    the bytes with the same ``palette_swap`` restores the input indices.
+
+    Raises ``ValueError`` if any index is outside 0..3.
+    """
+    bit_order = _validate_bit_order(bit_order)
+    arr = _as_index_patterns(patterns, 3)
+    arr = _apply_palette_swap(arr, palette_swap, 4, inverse=True)
+    low = arr & 1
+    high = (arr >> 1) & 1
+    pack_order = "big" if bit_order == "msb" else "little"
+    low_bytes = np.packbits(low, axis=2, bitorder=pack_order)[:, :, 0]
+    high_bytes = np.packbits(high, axis=2, bitorder=pack_order)[:, :, 0]
+    if interleaved:
+        out = np.stack((low_bytes, high_bytes), axis=2)  # (n, 8, 2)
+    else:
+        out = np.concatenate((low_bytes, high_bytes), axis=1)  # (n, 16)
+    return out.tobytes()
+
+
+def unpack_tiles_2bpp(
+    data,
+    n_tiles: int | None = None,
+    *,
+    bit_order: str = "msb",
+    interleaved: bool = True,
+    palette_swap=None,
+) -> np.ndarray:
+    """Decode ``16 * n`` GB 2bpp bytes back to (n, 8, 8) uint8 indices.
+
+    ``n_tiles`` is inferred from the data length when omitted. Layout options
+    must match those used to pack. ``palette_swap`` optionally decodes stored
+    indices through a different palette (``palette_swap[stored]`` is the
+    logical index it displays as); with the same swap used for packing, the
+    original indices are restored.
+
+    Raises ``ValueError`` on a truncated/oversized buffer, a bad data type, or
+    an invalid layout option.
+    """
+    bit_order = _validate_bit_order(bit_order)
+    raw = _as_byte_buffer(data)
+    n = _infer_tile_count(raw.size, 16, n_tiles)
+    if interleaved:
+        planes = raw.reshape(n, 8, 2)
+        low_bytes = planes[:, :, 0]
+        high_bytes = planes[:, :, 1]
+    else:
+        planes = raw.reshape(n, 2, 8)
+        low_bytes = planes[:, 0, :]
+        high_bytes = planes[:, 1, :]
+    shifts = np.array(
+        [7, 6, 5, 4, 3, 2, 1, 0] if bit_order == "msb" else [0, 1, 2, 3, 4, 5, 6, 7],
+        dtype=np.uint8,
+    )
+    low = ((low_bytes[:, :, None] >> shifts) & 1).astype(np.uint8)
+    high = ((high_bytes[:, :, None] >> shifts) & 1).astype(np.uint8)
+    indices = low | (high << 1)
+    return _apply_palette_swap(indices, palette_swap, 4)
+
+
+def pack_tiles_1bpp(
+    patterns,
+    *,
+    bit_order: str = "msb",
+    palette_swap=None,
+) -> bytes:
+    """Pack (n, 8, 8) 1-bit indices into ``8 * n`` bytes (one row per byte).
+
+    Indices must be 0 or 1. ``palette_swap`` is an optional length-2
+    permutation (``(1, 0)`` inverts the tile) applied with the same
+    stored-index semantics as :func:`pack_tiles_2bpp`.
+    """
+    bit_order = _validate_bit_order(bit_order)
+    arr = _as_index_patterns(patterns, 1)
+    arr = _apply_palette_swap(arr, palette_swap, 2, inverse=True)
+    pack_order = "big" if bit_order == "msb" else "little"
+    return np.packbits(arr, axis=2, bitorder=pack_order).reshape(-1).tobytes()
+
+
+def unpack_tiles_1bpp(
+    data,
+    n_tiles: int | None = None,
+    *,
+    bit_order: str = "msb",
+    palette_swap=None,
+) -> np.ndarray:
+    """Decode ``8 * n`` 1bpp bytes back to (n, 8, 8) uint8 indices (0/1).
+
+    ``n_tiles`` is inferred from the data length when omitted; layout must
+    match packing. ``palette_swap`` decodes stored indices through a
+    (possibly different) palette with the same semantics as
+    :func:`pack_tiles_2bpp`.
+    """
+    bit_order = _validate_bit_order(bit_order)
+    raw = _as_byte_buffer(data)
+    n = _infer_tile_count(raw.size, 8, n_tiles)
+    unpack_order = "big" if bit_order == "msb" else "little"
+    indices = np.unpackbits(raw, bitorder=unpack_order).reshape(n, 8, 8)
+    return _apply_palette_swap(indices, palette_swap, 2)
+
+
+def _as_byte_buffer(data) -> np.ndarray:
+    """Return a flat uint8 view of a bytes-like object (no copy when possible)."""
+    if isinstance(data, np.ndarray):
+        if data.dtype != np.uint8:
+            raise TypeError(f"packed data must be uint8, got {data.dtype}")
+        return data.reshape(-1)
+    try:
+        view = memoryview(data)
+    except TypeError as exc:
+        raise TypeError("packed data must be bytes-like") from exc
+    if view.ndim != 1 or view.itemsize != 1:
+        raise TypeError("packed data must be a flat byte buffer")
+    return np.frombuffer(view, dtype=np.uint8)
+
+
+def _infer_tile_count(n_bytes: int, tile_bytes: int, n_tiles: int | None) -> int:
+    if n_tiles is None:
+        if n_bytes % tile_bytes:
+            raise ValueError(
+                f"packed data length {n_bytes} is not a multiple of "
+                f"{tile_bytes} bytes per tile"
+            )
+        return n_bytes // tile_bytes
+    if not isinstance(n_tiles, (int, np.integer)) or n_tiles < 0:
+        raise ValueError(f"n_tiles must be a non-negative integer, got {n_tiles!r}")
+    expected = int(n_tiles) * tile_bytes
+    if n_bytes != expected:
+        raise ValueError(
+            f"packed data length {n_bytes} does not match {n_tiles} tiles "
+            f"({expected} bytes)"
+        )
+    return int(n_tiles)
+
+
+# ---------------------------------------------------------------------------
 # Stage 3 -- palette packing
 # ---------------------------------------------------------------------------
 #
