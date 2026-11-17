@@ -9,6 +9,7 @@ breakdown these functions implement.
 
 import heapq
 import threading
+import time
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -352,6 +353,336 @@ def cap_palette_colors(
             pals[np.all(pals == old, axis=2)] = new
 
     return np.stack([luminance_sort(p) for p in pals]).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b -- multi-image shared-palette solver
+# ---------------------------------------------------------------------------
+#
+# Several images, each fit independently, end up with their own 4-color
+# palettes that collide (near-duplicate or conflicting colors) once combined.
+# This solver instead fits ONE shared 4-color palette over the pooled pixel
+# colors of all images, weighting by usage frequency, and returns each image's
+# nearest-color mapping table plus the total perceptual error. All color
+# distances are Euclidean in CIELAB, matching the rest of Stage 3; the shared
+# palette is RGB555-snapped and luminance-sorted like every hardware palette.
+#
+# Two deterministic seeding algorithms are offered ("greedy" / "mediancut"),
+# both followed by ``n_iter`` weighted Lloyd refinement passes. No RNG is used
+# anywhere, so identical inputs always give bit-identical outputs.
+
+
+@dataclass
+class ColorMapping:
+    """One source-color -> shared-palette-color mapping for a single image."""
+
+    source_rgb: tuple        # (R, G, B) uint8 -- a distinct color of the image
+    target_rgb: tuple        # (R, G, B) uint8 -- nearest shared-palette entry
+    target_index: int        # index of target_rgb in the shared palette
+    delta_e: float           # Euclidean CIELAB distance between the two
+    pixel_count: int         # pixels of this image carrying source_rgb
+
+
+@dataclass
+class SharedPaletteResult:
+    """Outcome of ``solve_shared_palette`` over one image set."""
+
+    palette: np.ndarray            # (4, 3) uint8, RGB555-snapped, lum-sorted
+    mappings: list                 # list[list[ColorMapping]], one per image
+    total_error: float             # pooled weighted sum of pixel dE
+    per_image_error: list          # weighted sum of pixel dE per image
+    own_palettes: np.ndarray       # (n_images, 4, 3) uint8 -- each image's own
+                                   # independently fitted 4-color palette
+    palette_diff: list             # mean nearest-entry dE from each own palette
+                                   # to the shared palette (per-image conflict)
+    solve_seconds: float           # wall-clock solve time (perf_counter)
+
+
+def _coerce_rgb_array(image) -> np.ndarray:
+    """Accept an (H, W, 3) array or a PIL image; return a uint8 (H, W, 3) view."""
+    if isinstance(image, Image.Image):
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("each image must have shape (H, W, 3) RGB")
+    return arr
+
+
+def _weighted_median_index(weights: np.ndarray) -> int:
+    """Stable index that splits nonnegative ``weights`` as evenly as possible.
+
+    The smallest index whose cumulative weight reaches half the total; clamped
+    to [1, n-1] so a split always has at least one point on each side.
+    """
+    n = len(weights)
+    if n <= 1:
+        return 0
+    half = float(weights.sum()) * 0.5
+    idx = int(np.searchsorted(np.cumsum(weights), half, side="right"))
+    return min(max(idx, 1), n - 1)
+
+
+def _greedy_seed_lab(points_lab: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+    """Frequency-weighted farthest-point seeding in Lab space -> (k, 3) centers.
+
+    First center = heaviest (most frequent) color. Each subsequent center is
+    the color maximizing ``frequency x squared perceptual distance to the
+    nearest already-chosen center`` -- usage count and perceptual separation
+    together decide every pick. Deterministic: ties resolve by color order.
+    """
+    n = len(points_lab)
+    if n <= k:
+        return points_lab.copy()
+    first = int(np.argmax(weights))
+    centers = [points_lab[first]]
+    nearest_d2 = np.sum((points_lab - points_lab[first]) ** 2, axis=1)
+    for _ in range(1, k):
+        score = weights * nearest_d2
+        j = int(np.argmax(score))
+        centers.append(points_lab[j])
+        nearest_d2 = np.minimum(
+            nearest_d2, np.sum((points_lab - points_lab[j]) ** 2, axis=1)
+        )
+    return np.asarray(centers, dtype=np.float64)
+
+
+def _mediancut_seed_lab(points_lab: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+    """Weighted median-cut seeding in Lab space -> (k, 3) centers.
+
+    Repeatedly splits the box with the largest weighted Lab range along its
+    longest axis, at the count-weighted median; a flat box (zero range) splits
+    in half by member count instead. Each surviving box contributes its
+    pixel-count-weighted Lab centroid. Deterministic and allocation-free of
+    any RNG.
+    """
+    n = len(points_lab)
+    if n <= k:
+        return points_lab.copy()
+    boxes = [np.arange(n, dtype=np.int64)]
+    while len(boxes) < k:
+        ranges = np.asarray([
+            0.0
+            if len(b) == 1
+            else float((points_lab[b].max(axis=0) - points_lab[b].min(axis=0)).max())
+            for b in boxes
+        ])
+        # Prefer a splittable (multi-member) box: singletons can only be
+        # reached once every box holds a single distinct color.
+        candidates = np.flatnonzero([len(b) > 1 for b in boxes])
+        if candidates.size == 0:
+            break
+        bi = int(candidates[np.argmax(ranges[candidates])])
+        box = boxes.pop(bi)
+        if ranges[bi] <= 0.0:
+            # Flat box: split in half by member count instead of an axis.
+            cut = max(1, len(box) // 2)
+            left, right = box[:cut], box[cut:]
+        else:
+            axis = int(np.argmax(
+                points_lab[box].max(axis=0) - points_lab[box].min(axis=0)
+            ))
+            order = np.argsort(points_lab[box, axis], kind="stable")
+            ordered = box[order]
+            cut = _weighted_median_index(weights[ordered])
+            left, right = ordered[:cut], ordered[cut:]
+        boxes.extend([left, right])
+    centers = np.empty((len(boxes), 3), dtype=np.float64)
+    for i, b in enumerate(boxes):
+        w = weights[b]
+        centers[i] = np.average(points_lab[b], axis=0, weights=w)
+    return centers
+
+
+def _lloyd_refine_lab(
+    points_lab: np.ndarray, weights: np.ndarray, centers: np.ndarray, n_iter: int
+) -> np.ndarray:
+    """Weighted Lloyd iterations in Lab space; stops early once centers settle."""
+    centers = np.asarray(centers, dtype=np.float64).copy()
+    k = centers.shape[0]
+    for _ in range(max(0, int(n_iter))):
+        d2 = np.sum(
+            (points_lab[:, None, :] - centers[None, :, :]) ** 2, axis=2
+        )  # (n, k)
+        labels = np.argmin(d2, axis=1)  # stable on ties
+        new_centers = centers.copy()
+        for c in range(k):
+            mask = labels == c
+            if mask.any():
+                w = weights[mask]
+                new_centers[c] = (points_lab[mask] * w[:, None]).sum(0) / w.sum()
+        if float(np.max(np.abs(new_centers - centers))) < 1e-9:
+            centers = new_centers
+            break
+        centers = new_centers
+    return centers
+
+
+def _dedupe_snapped(palette_rgb: np.ndarray) -> np.ndarray:
+    """Drop duplicate RGB rows of a (m, 3) uint8 palette, order preserved."""
+    seen = []
+    keep = []
+    for i, row in enumerate(palette_rgb):
+        key = tuple(int(v) for v in row)
+        if key not in seen:
+            seen.append(key)
+            keep.append(i)
+    return palette_rgb[np.asarray(keep, dtype=np.int64)]
+
+
+def _fit_own_palette(colors_rgb: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """One image's own 4-color palette, fitted exactly as pack_palettes would.
+
+    <=4 distinct colors are represented exactly (no fitting); larger sets get
+    weighted 4-means in Lab via the shared deterministic k-means path. Output
+    is RGB555-snapped, padded to 4 rows and luminance-sorted.
+    """
+    if len(colors_rgb) <= 4:
+        palette = np.asarray(colors_rgb, dtype=np.uint8)
+    else:
+        centers = _weighted_kmeans_lab(
+            _rgb_to_lab(colors_rgb), counts.astype(np.float64), 4
+        )
+        palette = _lab_to_rgb_u8(centers)
+    return luminance_sort(snap_rgb555(_pad4(palette))).astype(np.uint8)
+
+
+def solve_shared_palette(
+    images: list,
+    *,
+    algorithm: str = "greedy",
+    n_iter: int = 10,
+) -> SharedPaletteResult:
+    """Fit one shared 4-color palette over multiple images.
+
+    ``images`` is a non-empty list of (H, W, 3) uint8 arrays and/or RGB PIL
+    images. Their distinct colors are pooled with pixel-count weights so the
+    fit sees every image's usage frequency; ``algorithm`` selects the seeding
+    strategy -- ``"greedy"`` (frequency-weighted farthest-point: each pick
+    maximizes frequency x squared Lab distance) or ``"mediancut"`` (weighted
+    median-cut boxes) -- and ``n_iter`` weighted Lloyd refinement passes run
+    afterwards (0 returns the raw seed). The fitted centers are snapped to
+    RGB555; any snap collisions are repaired against the pooled colors before
+    the palette is padded to 4 rows and luminance-sorted.
+
+    Each image then gets a mapping table from its own distinct colors to the
+    nearest shared-palette entry (Euclidean CIELAB), alongside its own
+    independently fitted 4-color palette and the mean nearest-entry dE between
+    the two (how much the shared compromise costs that image). Total error is
+    the pixel-count-weighted sum of per-pixel dE across every image.
+
+    Raises:
+        ValueError: ``images`` is empty/None, an entry is not a valid RGB
+            image, an image has zero pixels, ``algorithm`` is unknown, or
+            ``n_iter`` is negative.
+    """
+    if not images:
+        raise ValueError("image set is empty: at least one image is required")
+    if algorithm not in ("greedy", "mediancut"):
+        raise ValueError(
+            f"unknown algorithm: {algorithm!r} (expected 'greedy' or 'mediancut')"
+        )
+    if int(n_iter) < 0:
+        raise ValueError(f"n_iter must be >= 0, got {n_iter!r}")
+
+    t0 = time.perf_counter()
+
+    arrays = [_coerce_rgb_array(img) for img in images]
+    for i, arr in enumerate(arrays):
+        if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
+            raise ValueError(f"image {i} has zero pixels")
+
+    # Per-image distinct colors/counts, then the pooled frequency table.
+    per_image_colors = []
+    per_image_counts = []
+    for arr in arrays:
+        cols, cnts = np.unique(arr.reshape(-1, 3), axis=0, return_counts=True)
+        per_image_colors.append(cols)
+        per_image_counts.append(cnts.astype(np.float64))
+
+    pooled_cols, pooled_inv = np.unique(
+        np.concatenate([c for c in per_image_colors], axis=0),
+        axis=0,
+        return_inverse=True,
+    )
+    pooled_weights = np.zeros(len(pooled_cols), dtype=np.float64)
+    offset = 0
+    for cols, cnts in zip(per_image_colors, per_image_counts):
+        pooled_weights[pooled_inv[offset:offset + len(cols)]] = cnts
+        offset += len(cols)
+    pooled_lab = _rgb_to_lab(pooled_cols)
+
+    # --- Seed -> refine -> snap to hardware colors --------------------------
+    if algorithm == "greedy":
+        centers = _greedy_seed_lab(pooled_lab, pooled_weights, 4)
+    else:
+        centers = _mediancut_seed_lab(pooled_lab, pooled_weights, 4)
+    centers = _lloyd_refine_lab(pooled_lab, pooled_weights, centers, n_iter)
+
+    palette = _dedupe_snapped(snap_rgb555(_lab_to_rgb_u8(centers)))
+
+    # RGB555 snapping can collapse two distinct centers onto one hardware
+    # color. Repair back to 4 distinct entries by greedily re-adding the
+    # heaviest pooled color not yet represented, until the palette is full.
+    if len(palette) < 4:
+        present = {tuple(int(v) for v in row) for row in palette}
+        order = np.argsort(-pooled_weights, kind="stable")
+        for j in order:
+            if len(palette) >= 4:
+                break
+            candidate = tuple(int(v) for v in pooled_cols[j])
+            if candidate not in present:
+                present.add(candidate)
+                palette = np.concatenate(
+                    [palette, pooled_cols[j][None, :]], axis=0
+                )
+    palette = luminance_sort(snap_rgb555(_pad4(palette))).astype(np.uint8)
+    pal_lab = _rgb_to_lab(palette)
+
+    # --- Per-image mapping tables, errors, and own-palette differences -------
+    mappings = []
+    per_image_error = []
+    own_palettes = []
+    palette_diff = []
+    total_error = 0.0
+    for cols, cnts in zip(per_image_colors, per_image_counts):
+        col_lab = _rgb_to_lab(cols)
+        nearest = _nearest_indices(col_lab, pal_lab)
+        dist = np.sqrt(
+            np.sum((col_lab - pal_lab[nearest]) ** 2, axis=1)
+        )
+        img_error = float((dist * cnts).sum())
+        per_image_error.append(img_error)
+        total_error += img_error
+        mappings.append([
+            ColorMapping(
+                source_rgb=tuple(int(v) for v in cols[i]),
+                target_rgb=tuple(int(v) for v in palette[nearest[i]]),
+                target_index=int(nearest[i]),
+                delta_e=float(dist[i]),
+                pixel_count=int(cnts[i]),
+            )
+            for i in range(len(cols))
+        ])
+
+        own = _fit_own_palette(cols, cnts.astype(np.int64))
+        own_palettes.append(own)
+        own_lab = _rgb_to_lab(own)
+        own_d = np.sqrt(
+            np.sum(
+                (own_lab[:, None, :] - pal_lab[None, :, :]) ** 2, axis=2
+            ).min(axis=1)
+        )
+        palette_diff.append(float(own_d.mean()))
+
+    return SharedPaletteResult(
+        palette=palette,
+        mappings=mappings,
+        total_error=float(total_error),
+        per_image_error=per_image_error,
+        own_palettes=np.stack(own_palettes).astype(np.uint8),
+        palette_diff=palette_diff,
+        solve_seconds=time.perf_counter() - t0,
+    )
 
 
 def pack_palettes_mono(image: np.ndarray, ramp: np.ndarray) -> tuple:
