@@ -958,6 +958,307 @@ def dedup_patterns(gb: GBImage, allow_flips: bool) -> GBImage:
 
 
 # ---------------------------------------------------------------------------
+# Stage 5b -- multi-resolution export
+# ---------------------------------------------------------------------------
+#
+# One source asset, several target screens: resample to each requested target
+# size, snap the canvas onto the 8x8 tile grid (pad out, crop in, or reject),
+# optionally trim uniform borders first, then emit a tileset + tilemap +
+# per-cell map offset table so every export is independently reconstructible.
+# This stage is deliberately self-contained (numpy + PIL only): it neither
+# calls nor alters the GB/GBC hardware pipeline above -- the fixed-size logo
+# path is byte-for-byte untouched -- and does not quantize to 4-color
+# palettes, so it serves arbitrary screen targets while sharing the same
+# 8x8 tile vocabulary. See tests/test_multires.py for the contract.
+
+TILE = 8
+ALIGN_STRATEGIES = ("pad", "crop", "reject")
+RESAMPLE_FILTERS = ("nearest", "box", "bilinear", "bicubic", "lanczos")
+_PIL_RESAMPLE = {
+    "nearest": Image.Resampling.NEAREST,
+    "box": Image.Resampling.BOX,
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "lanczos": Image.Resampling.LANCZOS,
+}
+
+
+@dataclass
+class MultiresResult:
+    """One target-size export of a source asset.
+
+    ``image`` is the final aligned RGB canvas (H, W both multiples of 8);
+    ``tileset`` holds one 8x8 RGB tile per unique tile content, in
+    first-appearance (raster) order; ``tilemap`` (th, tw) indexes the tileset
+    per cell; ``map_offsets`` is the per-cell table locating each cell's tile
+    inside the aligned canvas -- rows of (row, col, x, y, padded) -- with
+    ``padded=1`` for cells covered by alignment padding; ``pad_ratio`` is the
+    fraction of canvas pixels contributed by padding; ``content_box`` is the
+    (left, top, right, bottom) pixel box actually occupied by source content
+    after any edge trim/alignment (pixels outside it are padding).
+    """
+
+    image: Image.Image
+    tileset: np.ndarray          # (n_unique, 8, 8, 3) uint8
+    tilemap: np.ndarray          # (th, tw) int32 -> tileset row per cell
+    map_offsets: list            # list[(row, col, x, y, padded)]
+    pad_ratio: float
+    content_box: tuple           # (left, top, right, bottom) of real content
+    target_size: tuple           # requested (width, height)
+    canvas_size: tuple           # delivered (width, height), 8-multiples
+
+
+def _validate_target_size(target_size) -> tuple:
+    """Validate a ``(width, height)`` target: a 2-int sequence of positive px.
+
+    Returns the normalized tuple; raises TypeError/ValueError with an
+    actionable message on anything else (floats, wrong length, zero/negative,
+    or non-numeric entries).
+    """
+    if isinstance(target_size, (str, bytes)) or not hasattr(target_size, "__len__"):
+        raise TypeError(
+            f"target_size must be a (width, height) sequence, got "
+            f"{type(target_size).__name__}"
+        )
+    if len(target_size) != 2:
+        raise ValueError(
+            f"target_size must have exactly 2 entries (width, height), "
+            f"got {len(target_size)}: {target_size!r}"
+        )
+    out = []
+    for axis, value in zip(("width", "height"), target_size):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(
+                f"target_size {axis} must be an integer number of pixels, "
+                f"got {value!r} ({type(value).__name__})"
+            )
+        if int(value) <= 0:
+            raise ValueError(
+                f"target_size {axis} must be positive, got {int(value)}"
+            )
+        out.append(int(value))
+    return tuple(out)
+
+
+def crop_to_content(
+    image: Image.Image, pad_color=(0, 0, 0), tolerance: int = 0
+) -> tuple:
+    """Return the tightest ``(left, top, right, bottom)`` box of non-border px.
+
+    The border color is the image's four-corner consensus (all four corners
+    must agree, else the whole image is treated as content). A pixel counts as
+    border when every channel is within ``tolerance`` of the border color.
+    A fully uniform image collapses to a zero-area box at the top-left.
+    """
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    h, w = arr.shape[:2]
+    corners = np.stack(
+        [arr[0, 0], arr[0, w - 1], arr[h - 1, 0], arr[h - 1, w - 1]]
+    )
+    if not np.all(corners == corners[0]):
+        return (0, 0, w, h)
+    border = corners[0].astype(np.int16)
+    mask = np.any(np.abs(arr - border) > int(tolerance), axis=2)  # (h, w) bool
+    if not mask.any():
+        return (0, 0, 0, 0)
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    return (int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
+
+
+def align_to_tile_grid(
+    image: Image.Image,
+    strategy: str = "pad",
+    pad_color=(0, 0, 0),
+) -> tuple:
+    """Snap an RGB image onto the 8x8 grid without resampling its content.
+
+    ``strategy`` selects the alignment policy:
+
+    * ``"pad"`` (default): center the image on an 8-multiple canvas, extending
+      the bottom/right by one extra pixel when the gap is odd so the content
+      stays centered; the added border is filled with ``pad_color``.
+    * ``"crop"``: center-crop back to the largest 8-multiple canvas that fits
+      (the same center convention as the hardware pipeline's input crop).
+    * ``"reject"``: raise ValueError unless both dimensions are already
+      multiples of 8 -- nothing is added or removed.
+
+    Returns ``(aligned_image, content_box)`` where ``content_box`` is the
+    source content's (left, top, right, bottom) box inside the aligned canvas
+    (the full box when nothing was padded).
+    """
+    if strategy not in ALIGN_STRATEGIES:
+        raise ValueError(
+            f"unknown alignment strategy: {strategy!r}; "
+            f"expected one of {ALIGN_STRATEGIES}"
+        )
+    img = image.convert("RGB")
+    w, h = img.size
+    nw, nh = (w // TILE) * TILE, (h // TILE) * TILE
+
+    if strategy == "reject":
+        if (nw, nh) != (w, h):
+            raise ValueError(
+                f"image size {w}x{h} is not a multiple of {TILE} on both "
+                f"axes and strategy='reject' forbids padding/cropping"
+            )
+        return img, (0, 0, w, h)
+
+    if strategy == "crop":
+        if nw < TILE or nh < TILE:
+            raise ValueError(
+                f"image is smaller than one {TILE}x{TILE} tile after cropping"
+            )
+        if (nw, nh) == (w, h):
+            return img, (0, 0, w, h)
+        left = (w - nw) // 2
+        top = (h - nh) // 2
+        return img.crop((left, top, left + nw, top + nh)), (0, 0, nw, nh)
+
+    # strategy == "pad": grow each axis to the next multiple of 8.
+    pw = (TILE - w % TILE) % TILE
+    ph = (TILE - h % TILE) % TILE
+    if pw == 0 and ph == 0:
+        return img, (0, 0, w, h)
+    canvas_w, canvas_h = w + pw, h + ph
+    left = pw // 2
+    top = ph // 2
+    fill = tuple(int(c) for c in np.asarray(pad_color, dtype=np.uint8).reshape(-1)[:3])
+    canvas = Image.new("RGB", (canvas_w, canvas_h), fill)
+    canvas.paste(img, (left, top))
+    return canvas, (left, top, left + w, top + h)
+
+
+def _build_tileset(arr: np.ndarray, content_box: tuple) -> tuple:
+    """Slice an 8-multiple RGB array into unique 8x8 tiles + map offset table.
+
+    Tiles are deduplicated by exact RGB content in raster (first-appearance)
+    order. Returns ``(tileset, tilemap, map_offsets, pad_mask)`` where
+    ``map_offsets`` rows are (tile_row, tile_col, x, y, padded) and pad_mask is
+    a (th, tw) bool marking cells that contain any padding pixel (i.e. fall
+    partially or fully outside ``content_box``).
+    """
+    h, w = arr.shape[:2]
+    th, tw = h // TILE, w // TILE
+    left, top, right, bottom = content_box
+    tiles: list = []
+    lookup: dict = {}
+    tilemap = np.zeros((th, tw), dtype=np.int32)
+    pad_mask = np.zeros((th, tw), dtype=bool)
+    map_offsets: list = []
+
+    for tr in range(th):
+        for tc in range(tw):
+            x, y = tc * TILE, tr * TILE
+            tile = arr[y : y + TILE, x : x + TILE]
+            # A cell is padding if its pixel box does not sit fully inside the
+            # content box; cells intersecting content are never marked.
+            padded = not (x >= left and y >= top
+                          and x + TILE <= right and y + TILE <= bottom)
+            pad_mask[tr, tc] = padded
+            key = tile.tobytes()
+            idx = lookup.get(key)
+            if idx is None:
+                idx = len(tiles)
+                lookup[key] = idx
+                tiles.append(tile.copy())
+            tilemap[tr, tc] = idx
+            map_offsets.append((tr, tc, x, y, 1 if padded else 0))
+
+    tileset = (
+        np.stack(tiles).astype(np.uint8)
+        if tiles else np.zeros((0, TILE, TILE, 3), dtype=np.uint8)
+    )
+    return tileset, tilemap, map_offsets, pad_mask
+
+
+def multires_export(
+    image: Image.Image,
+    target_size,
+    *,
+    align: str = "pad",
+    resample: str = "lanczos",
+    crop_edges: bool = False,
+    pad_color=(0, 0, 0),
+) -> MultiresResult:
+    """Export one source asset at one target screen size.
+
+    Pipeline: optional uniform-border trim (``crop_edges``) -> resample to
+    ``target_size`` with the chosen PIL filter -> snap to the 8x8 grid per
+    ``align`` (``"pad"``/``"crop"``/``"reject"``) -> emit the unique-tile
+    tileset, the cell->tile tilemap, and the per-cell map offset table.
+
+    ``target_size`` is a positive integer ``(width, height)`` tuple; anything
+    else raises TypeError/ValueError before any pixel work. ``resample`` is
+    one of ``RESAMPLE_FILTERS``. ``pad_color`` fills alignment padding and is
+    also the assumed border color when trimming. The delivered canvas is
+    always an exact multiple of 8 on both axes, and reconstructing it from
+    ``tileset``/``tilemap`` reproduces every pixel (see test_multires.py).
+    """
+    width, height = _validate_target_size(target_size)
+    if align not in ALIGN_STRATEGIES:
+        raise ValueError(
+            f"unknown alignment strategy: {align!r}; "
+            f"expected one of {ALIGN_STRATEGIES}"
+        )
+    if resample not in _PIL_RESAMPLE:
+        raise ValueError(
+            f"unknown resample filter: {resample!r}; "
+            f"expected one of {tuple(_PIL_RESAMPLE)}"
+        )
+
+    img = image.convert("RGB")
+    if crop_edges:
+        box = crop_to_content(img, pad_color=pad_color)
+        if box[2] > box[0] and box[3] > box[1]:
+            img = img.crop(box)
+
+    if img.size != (width, height):
+        img = img.resize((width, height), _PIL_RESAMPLE[resample])
+
+    aligned, content_box = align_to_tile_grid(img, align, pad_color)
+    arr = np.asarray(aligned, dtype=np.uint8)
+    tileset, tilemap, map_offsets, pad_mask = _build_tileset(arr, content_box)
+
+    canvas_h, canvas_w = arr.shape[:2]
+    # Exact padding pixels: canvas area minus the content box area (the box is
+    # real source pixels by construction; only pad strategy creates one).
+    left, top, right, bottom = content_box
+    content_pixels = max(0, right - left) * max(0, bottom - top)
+    pad_pixels = canvas_h * canvas_w - content_pixels
+    pad_ratio = pad_pixels / float(canvas_h * canvas_w)
+
+    return MultiresResult(
+        image=aligned,
+        tileset=tileset,
+        tilemap=tilemap,
+        map_offsets=map_offsets,
+        pad_ratio=pad_ratio,
+        content_box=content_box,
+        target_size=(width, height),
+        canvas_size=(canvas_w, canvas_h),
+    )
+
+
+def reconstruct_multires(result: MultiresResult) -> np.ndarray:
+    """Rebuild the aligned canvas array from a result's tileset + tilemap.
+
+    Independent of ``result.image``: the returned (H, W, 3) uint8 array is
+    assembled purely from the tileset and tilemap, so equality with the
+    delivered image is a real round-trip guarantee rather than an alias.
+    """
+    th, tw = result.tilemap.shape
+    out = np.zeros((th * TILE, tw * TILE, 3), dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            y, x = tr * TILE, tc * TILE
+            out[y : y + TILE, x : x + TILE] = result.tileset[
+                int(result.tilemap[tr, tc])
+            ]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Stage 6 -- budget merge (lossy)
 # ---------------------------------------------------------------------------
 #
