@@ -9,6 +9,8 @@ breakdown these functions implement.
 
 import heapq
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -1880,3 +1882,423 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Map chunking -- viewport-sized tile index, center-out load order, and
+# streaming load/unload for maps too large to hold resident all at once.
+# ---------------------------------------------------------------------------
+#
+# A chunk is a fixed pixel rectangle of an already-rendered map. Chunking
+# slices the *rendered pixel grid* (the output of ``render`` /
+# ``convert_for_hardware``): it never re-quantizes, re-palettes, or re-renders
+# anything, which is what makes stitching every chunk back together a
+# pixel-identical copy of the whole-image render by construction. The loader
+# that supplies a chunk's pixels is injected by the caller, so the same code
+# streams from RAM, disk, or any other store without I/O libraries of its own.
+
+
+@dataclass(frozen=True)
+class ChunkInfo:
+    """Metadata for one map chunk -- geometry only, no pixel data.
+
+    ``row``/``col`` are the chunk-grid coordinates (origin top-left); the
+    pixel box is the half-open range [y0, y1) x [x0, x1) inside the map.
+    Edge chunks may be smaller than the nominal chunk size when the map's
+    dimensions do not divide evenly.
+    """
+
+    row: int
+    col: int
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    width: int
+    height: int
+    chebyshev: int  # Chebyshev distance from the map's center chunk
+
+
+@dataclass(frozen=True)
+class ChunkIndex:
+    """The full chunking of one map: grid geometry plus a load order.
+
+    ``chunks`` is a flat row-major list of ChunkInfo. ``load_order`` holds the
+    chunk (row, col) keys ordered center-out: the chunk covering the map's
+    center first, then expanding Chebyshev-distance rings, ties broken
+    top-to-bottom / left-to-right so the order is fully deterministic.
+    """
+
+    map_width: int
+    map_height: int
+    chunk_width: int
+    chunk_height: int
+    cols: int
+    rows: int
+    chunks: tuple  # tuple[ChunkInfo, ...]
+    load_order: tuple  # tuple[tuple[int, int], ...]
+
+    def chunk_at(self, row: int, col: int) -> ChunkInfo:
+        """Return the ChunkInfo at grid position (row, col)."""
+        if not (0 <= row < self.rows and 0 <= col < self.cols):
+            raise IndexError(
+                f"chunk ({row}, {col}) is outside the {self.rows}x{self.cols} grid"
+            )
+        return self.chunks[row * self.cols + col]
+
+    def chunks_for_viewport(self, x: int, y: int, width: int, height: int) -> tuple:
+        """Chunk (row, col) keys overlapping the half-open viewport [x,x+w)x[y,y+h)."""
+        if width <= 0 or height <= 0:
+            raise ValueError("viewport width and height must both be positive")
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(self.map_width, x + width)
+        y1 = min(self.map_height, y + height)
+        if x1 <= x0 or y1 <= y0:
+            return ()
+        c0 = x0 // self.chunk_width
+        c1 = (x1 - 1) // self.chunk_width
+        r0 = y0 // self.chunk_height
+        r1 = (y1 - 1) // self.chunk_height
+        return tuple(
+            (r, c)
+            for r in range(r0, r1 + 1)
+            for c in range(c0, c1 + 1)
+        )
+
+
+def _positive_int(value, name: str, *, allow_zero: bool = False) -> int:
+    """Validate a strictly-positive (or non-negative with allow_zero) int.
+
+    Booleans are rejected explicitly: ``True`` is an int in Python but is
+    never a legal dimension or radius here.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+    elif value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
+
+
+def build_chunk_index(
+    map_width: int,
+    map_height: int,
+    chunk_width: int,
+    chunk_height: int,
+) -> ChunkIndex:
+    """Slice a ``map_width`` x ``map_height`` map into a grid of chunks.
+
+    Chunk size is configurable. Raises ValueError on a non-positive or
+    oversized chunk size (a chunk larger than the map in either dimension
+    would make the grid ambiguous, so it is rejected rather than silently
+    collapsed to one chunk), and TypeError on non-integer arguments.
+    """
+    map_width = _positive_int(map_width, "map_width")
+    map_height = _positive_int(map_height, "map_height")
+    chunk_width = _positive_int(chunk_width, "chunk_width")
+    chunk_height = _positive_int(chunk_height, "chunk_height")
+    if chunk_width > map_width or chunk_height > map_height:
+        raise ValueError(
+            f"chunk size {chunk_width}x{chunk_height} exceeds map size "
+            f"{map_width}x{map_height}"
+        )
+
+    cols = (map_width + chunk_width - 1) // chunk_width
+    rows = (map_height + chunk_height - 1) // chunk_height
+    center_row = (rows - 1) // 2
+    center_col = (cols - 1) // 2
+
+    chunks = []
+    for r in range(rows):
+        for c in range(cols):
+            x0 = c * chunk_width
+            y0 = r * chunk_height
+            x1 = min(map_width, x0 + chunk_width)
+            y1 = min(map_height, y0 + chunk_height)
+            chunks.append(
+                ChunkInfo(
+                    row=r,
+                    col=c,
+                    x0=x0,
+                    y0=y0,
+                    x1=x1,
+                    y1=y1,
+                    width=x1 - x0,
+                    height=y1 - y0,
+                    chebyshev=max(abs(r - center_row), abs(c - center_col)),
+                )
+            )
+
+    # Center-out order: Chebyshev ring, then deterministic row-major tie-break.
+    order = sorted(
+        ((info.row, info.col) for info in chunks),
+        key=lambda rc: (
+            max(abs(rc[0] - center_row), abs(rc[1] - center_col)),
+            rc[0],
+            rc[1],
+        ),
+    )
+    return ChunkIndex(
+        map_width=map_width,
+        map_height=map_height,
+        chunk_width=chunk_width,
+        chunk_height=chunk_height,
+        cols=cols,
+        rows=rows,
+        chunks=tuple(chunks),
+        load_order=tuple(order),
+    )
+
+
+class ChunkStreamer:
+    """Streams map chunks on demand and evicts far-away ones to bound memory.
+
+    The ``loader`` callable receives a ChunkInfo and returns that chunk's
+    pixels as an ndarray (or an array-like that numpy can wrap). The streamer
+    keeps a working set of resident chunks centered on the most recently
+    focused viewport: every chunk within ``preload_radius`` Chebyshev rings
+    of the focus is loaded (the viewport's own chunks are ring 0), and chunks
+    outside the radius are unloaded. ``max_resident`` optionally hard-caps the
+    resident count, evicting least-recently-used chunks once exceeded (None =
+    bounded only by the preload radius). All load/unload timings and byte
+    accounting are exposed through ``metrics`` so callers can report peak
+    resident memory and loading cost without instrumenting the loader.
+    """
+
+    def __init__(
+        self,
+        index: ChunkIndex,
+        loader,
+        *,
+        preload_radius: int = 1,
+        max_resident: int | None = None,
+    ):
+        if not isinstance(index, ChunkIndex):
+            raise TypeError("index must be a ChunkIndex")
+        if not callable(loader):
+            raise TypeError("loader must be callable")
+        self.index = index
+        self._loader = loader
+        self.preload_radius = _positive_int(
+            preload_radius, "preload_radius", allow_zero=True
+        )
+        if max_resident is not None:
+            max_resident = _positive_int(max_resident, "max_resident")
+        self.max_resident = max_resident
+
+        # Resident pixels keyed by (row, col); OrderedDict doubles as the
+        # LRU book (move_to_end on every access).
+        self._resident: OrderedDict = OrderedDict()
+        self._resident_bytes = 0
+        self._peak_resident_bytes = 0
+        self._peak_resident_chunks = 0
+        self._loads = 0
+        self._unloads = 0
+        self._load_seconds = 0.0
+        self._last_loaded: tuple = ()
+        self._last_unloaded: tuple = ()
+
+    # -- resident-set inspection ------------------------------------------------
+
+    @property
+    def resident_keys(self) -> tuple:
+        return tuple(self._resident.keys())
+
+    @property
+    def resident_bytes(self) -> int:
+        return self._resident_bytes
+
+    @property
+    def metrics(self) -> dict:
+        """Cumulative streaming stats since construction."""
+        return {
+            "loads": self._loads,
+            "unloads": self._unloads,
+            "resident_chunks": len(self._resident),
+            "resident_bytes": self._resident_bytes,
+            "peak_resident_chunks": self._peak_resident_chunks,
+            "peak_resident_bytes": self._peak_resident_bytes,
+            "load_seconds": self._load_seconds,
+            "total_chunks": len(self.index.chunks),
+        }
+
+    # -- loading / unloading ----------------------------------------------------
+
+    def load_chunk(self, row: int, col: int) -> np.ndarray:
+        """Load one chunk (no-op if already resident) and return its pixels."""
+        key = (row, col)
+        if key in self._resident:
+            self._resident.move_to_end(key)
+            return self._resident[key]
+        info = self.index.chunk_at(row, col)
+        t0 = time.perf_counter()
+        pixels = np.asarray(self._loader(info))
+        dt = time.perf_counter() - t0
+        if pixels.shape[:2] != (info.height, info.width):
+            raise ValueError(
+                f"loader returned shape {pixels.shape} for chunk "
+                f"{info.width}x{info.height} ({row}, {col})"
+            )
+        self._resident[key] = pixels
+        self._resident_bytes += int(pixels.nbytes)
+        self._loads += 1
+        self._load_seconds += dt
+        self._last_loaded += (key,)
+        self._enforce_cap()
+        # Peak is measured AFTER cap enforcement: a synchronous eviction means
+        # the oversized intermediate set was never observable to a caller, so
+        # peak tracks the real memory bound the working set ever presented.
+        self._peak_resident_chunks = max(
+            self._peak_resident_chunks, len(self._resident)
+        )
+        self._peak_resident_bytes = max(
+            self._peak_resident_bytes, self._resident_bytes
+        )
+        return pixels
+
+    def unload_chunk(self, row: int, col: int) -> bool:
+        """Drop one chunk from the resident set; return whether it was present."""
+        key = (row, col)
+        pixels = self._resident.pop(key, None)
+        if pixels is None:
+            return False
+        self._resident_bytes -= int(pixels.nbytes)
+        self._unloads += 1
+        self._last_unloaded += (key,)
+        return True
+
+    def _enforce_cap(self) -> None:
+        if self.max_resident is None:
+            return
+        while len(self._resident) > self.max_resident:
+            key, pixels = self._resident.popitem(last=False)  # LRU first
+            self._resident_bytes -= int(pixels.nbytes)
+            self._unloads += 1
+            self._last_unloaded += (key,)
+
+    # -- viewport-driven streaming ----------------------------------------------
+
+    def focus_viewport(
+        self, x: int, y: int, width: int, height: int
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+        """Stream chunks for the viewport plus the preload ring around it.
+
+        Loads every chunk within ``preload_radius`` Chebyshev rings of the
+        viewport's chunks (center-out, per the index's load order), then
+        unloads resident chunks outside that ring and applies the LRU cap.
+        Returns (loaded_keys, unloaded_keys) for this call (cap evictions
+        included in unloaded); chunks already resident are neither counted
+        nor returned.
+        """
+        wanted = set(self.index.chunks_for_viewport(x, y, width, height))
+        if not wanted:
+            return (), ()
+        r_lo = min(r for r, _ in wanted) - self.preload_radius
+        r_hi = max(r for r, _ in wanted) + self.preload_radius
+        c_lo = min(c for _, c in wanted) - self.preload_radius
+        c_hi = max(c for _, c in wanted) + self.preload_radius
+        wanted = {
+            (r, c)
+            for r in range(max(0, r_lo), min(self.index.rows, r_hi + 1))
+            for c in range(max(0, c_lo), min(self.index.cols, c_hi + 1))
+        }
+
+        before = set(self._resident.keys())
+        for key in self.index.load_order:  # center-out ordering preserved
+            if key in wanted and key not in self._resident:
+                self.load_chunk(*key)
+
+        for key in list(self._resident.keys()):
+            if key not in wanted:
+                self.unload_chunk(*key)
+        # Ring filtering happens before the cap, so the cap only evicts when
+        # the preload ring itself exceeds max_resident. Deltas are derived from
+        # start/end snapshots so cap evictions (inside load_chunk or here) are
+        # never silently dropped from the returned unloaded tuple.
+        self._enforce_cap()
+        after = set(self._resident.keys())
+        loaded = tuple(k for k in self.index.load_order if k in after - before)
+        unloaded = tuple(k for k in before if k not in after)
+        self._last_loaded = loaded
+        self._last_unloaded = unloaded
+        return loaded, unloaded
+
+    def get_viewport_pixels(
+        self, x: int, y: int, width: int, height: int
+    ) -> np.ndarray:
+        """Assemble a cropped pixel array for the viewport from its chunks.
+
+        Focuses the viewport first (respecting preload/eviction), then copies
+        the overlapping region out of each chunk, reloading any chunk that a
+        small ``max_resident`` cap evicted between the two steps. Each crop is
+        a copy, so later eviction never invalidates a returned array.
+        """
+        _positive_int(x, "x", allow_zero=True)
+        _positive_int(y, "y", allow_zero=True)
+        _positive_int(width, "viewport_width")
+        _positive_int(height, "viewport_height")
+        x1, y1 = x + width, y + height
+        if x1 > self.index.map_width or y1 > self.index.map_height:
+            raise ValueError(
+                f"viewport ({x}, {y}, {width}x{height}) extends past the "
+                f"{self.index.map_width}x{self.index.map_height} map"
+            )
+        self.focus_viewport(x, y, width, height)
+
+        viewport_keys = self.index.chunks_for_viewport(x, y, width, height)
+        sample = self.load_chunk(*viewport_keys[0])
+        channels = sample.shape[2] if sample.ndim == 3 else 1
+        shape = (height, width, channels) if sample.ndim == 3 else (height, width)
+        out = np.zeros(shape, dtype=sample.dtype)
+        for key in viewport_keys:
+            info = self.index.chunk_at(*key)
+            chunk = self.load_chunk(*key)  # reload if the LRU cap evicted it
+            cx0, cx1 = max(info.x0, x) - info.x0, min(info.x1, x1) - info.x0
+            cy0, cy1 = max(info.y0, y) - info.y0, min(info.y1, y1) - info.y0
+            ox0, ox1 = max(info.x0, x) - x, min(info.x1, x1) - x
+            oy0, oy1 = max(info.y0, y) - y, min(info.y1, y1) - y
+            out[oy0:oy1, ox0:ox1] = chunk[cy0:cy1, cx0:cx1]
+        return out
+
+    def unload_all(self) -> tuple:
+        """Evict every resident chunk; returns the keys that were unloaded."""
+        keys = tuple(self._resident.keys())
+        for key in keys:
+            self.unload_chunk(*key)
+        return keys
+
+    # Last focus_viewport deltas (load_chunk/unload_chunk append outside focus).
+    @property
+    def last_loaded(self) -> tuple:
+        return self._last_loaded
+
+    @property
+    def last_unloaded(self) -> tuple:
+        return self._last_unloaded
+
+
+def stitch_chunks(index: ChunkIndex, chunks: dict) -> np.ndarray:
+    """Reassemble a full map array from a {chunk_key: pixels} mapping.
+
+    Every index chunk must be present. The output is allocated fresh and each
+    chunk is copied into its pixel box, so the result shares no memory with
+    its inputs and equals a whole-image render pixel-for-pixel whenever the
+    chunk pixels were sliced from that render.
+    """
+    if set(chunks.keys()) != {(info.row, info.col) for info in index.chunks}:
+        raise ValueError("chunks mapping must cover every chunk in the index")
+    sample = np.asarray(chunks[index.load_order[0]])
+    channels = sample.shape[2] if sample.ndim == 3 else 1
+    shape = (
+        (index.map_height, index.map_width, channels)
+        if sample.ndim == 3
+        else (index.map_height, index.map_width)
+    )
+    out = np.zeros(shape, dtype=sample.dtype)
+    for info in index.chunks:
+        pixels = np.asarray(chunks[(info.row, info.col)])
+        out[info.y0:info.y1, info.x0:info.x1] = pixels
+    return out
