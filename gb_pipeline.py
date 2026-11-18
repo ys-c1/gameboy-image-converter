@@ -1880,3 +1880,221 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Exported-tileset auto-trim (bbox -> crop + record offsets -> tile table)
+# ---------------------------------------------------------------------------
+#
+# Exported tiles often carry blank (background-colored) borders that waste
+# atlas space. `trim_tiles` crops every tile to its content bounding box --
+# where "content" is any pixel differing from the background by more than
+# ``threshold`` -- records each crop's offset, and writes (tile_id, off_y,
+# off_x) into a tile table. Cropped tiles are deduped so identical content
+# stored at different margins collapses to one atlas entry. All-background
+# tiles are REPORTED (``TrimmedAtlas.empty``) and stored as a 1x1 background
+# tile -- never cropped to a 0-size tile. `rebuild_tiles` inverts the trim:
+# at threshold 0 the reconstruction is pixel-identical to the input.
+
+
+@dataclass
+class TrimmedAtlas:
+    """A tileset with blank borders cropped away and offsets recorded."""
+
+    tiles: list          # unique cropped tiles (variable-size ndarrays)
+    table: np.ndarray    # (n, 3) int32: per source tile (tile_id, off_y, off_x)
+    empty: np.ndarray    # (k,) int64: source indices that were all-background
+    tile_size: tuple     # (h, w) of the source tiles
+    background: tuple    # background value used (per-channel for RGB)
+    threshold: float     # content threshold used
+    per_tile: bool       # True: per-tile bboxes; False: one union bbox
+
+
+def _tile_diff_mask(tile: np.ndarray, background: np.ndarray, threshold: float):
+    """Boolean (h, w) mask of pixels differing from background by > threshold.
+
+    Difference is the max absolute per-channel difference (Chebyshev), so a
+    pixel is background only when EVERY channel is within ``threshold``.
+    """
+    diff = np.abs(tile.astype(np.int16) - background.astype(np.int16))
+    if diff.ndim == 3:
+        diff = diff.max(axis=2)
+    return diff > threshold
+
+
+def find_content_bbox(
+    tile: np.ndarray, background, threshold: float = 0
+) -> tuple | None:
+    """Half-open (r0, c0, r1, c1) content bbox of one tile, or None if empty.
+
+    "Content" is any pixel whose per-channel difference from ``background``
+    exceeds ``threshold`` (see ``_tile_diff_mask``). A tile with no content
+    returns None -- callers must report it, not crop it to 0 size.
+    """
+    tile = np.asarray(tile)
+    bg = np.asarray(background, dtype=np.int16).reshape(-1)
+    mask = _tile_diff_mask(tile, bg, threshold)
+    if not mask.any():
+        return None
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    r0 = int(np.argmax(rows))
+    r1 = int(rows.shape[0] - np.argmax(rows[::-1]))
+    c0 = int(np.argmax(cols))
+    c1 = int(cols.shape[0] - np.argmax(cols[::-1]))
+    return (r0, c0, r1, c1)
+
+
+def _detect_background(tiles: np.ndarray) -> np.ndarray:
+    """Most frequent border pixel across the stack (the assumed background).
+
+    Border pixels (the outer ring of every tile) are overwhelmingly background
+    for margin-padded exports, so their mode is a robust automatic background.
+    """
+    n, h, w = tiles.shape[:3]
+    tail = tiles.shape[3:]
+    ring = np.concatenate(
+        [
+            tiles[:, 0, :].reshape(-1, *tail),
+            tiles[:, -1, :].reshape(-1, *tail),
+            tiles[:, 1:-1, 0].reshape(-1, *tail),
+            tiles[:, 1:-1, -1].reshape(-1, *tail),
+        ]
+    )
+    values, counts = np.unique(ring, axis=0, return_counts=True)
+    return np.atleast_1d(values[int(np.argmax(counts))])
+
+
+def trim_tiles(
+    tiles,
+    background="auto",
+    threshold: float = 0,
+    per_tile: bool = True,
+) -> TrimmedAtlas:
+    """Crop blank borders off a stack of tiles and record per-tile offsets.
+
+    ``tiles`` is an (n, h, w) index-tile stack or an (n, h, w, 3) RGB stack.
+    ``background`` is the background pixel value, or "auto" to take the mode
+    of the stack's border pixels. ``threshold`` is the per-channel difference
+    above which a pixel counts as content (0 = exact-match background only).
+    ``per_tile`` crops each tile to its own bbox; ``per_tile=False`` crops
+    every tile to the union bbox (one shared offset, uniform output size).
+
+    All-background tiles are listed in ``TrimmedAtlas.empty`` and stored as a
+    1x1 background tile at offset (0, 0) -- never as a 0-size tile. Cropped
+    tiles are deduped (same shape + same bytes), so ``len(atlas.tiles)`` is
+    the atlas tile count after trimming and ``atlas.table`` maps each source
+    tile to (tile_id, off_y, off_x). The source stack is not modified.
+    """
+    arr = np.asarray(tiles)
+    if arr.ndim not in (3, 4):
+        raise ValueError("tiles must be (n, h, w) or (n, h, w, 3)")
+    n, h, w = arr.shape[:3]
+    if threshold < 0:
+        raise ValueError("threshold must be >= 0")
+
+    if isinstance(background, str):
+        if background != "auto":
+            raise ValueError(f"unknown background mode: {background!r}")
+        bg = _detect_background(arr)
+    else:
+        bg = np.asarray(background, dtype=np.int16)
+    bg = np.atleast_1d(bg).astype(np.int16).reshape(-1)
+
+    # Stage 1: content bbox per tile (None for all-background tiles).
+    bboxes = [find_content_bbox(arr[i], bg, threshold) for i in range(n)]
+
+    empty = np.array([i for i, b in enumerate(bboxes) if b is None], dtype=np.int64)
+
+    if not per_tile:
+        # Union bbox over all non-empty tiles: one shared crop for the stack.
+        live = [b for b in bboxes if b is not None]
+        if live:
+            r0 = min(b[0] for b in live)
+            c0 = min(b[1] for b in live)
+            r1 = max(b[2] for b in live)
+            c1 = max(b[3] for b in live)
+            union = (r0, c0, r1, c1)
+            bboxes = [union if b is not None else None for b in bboxes]
+
+    # Stage 2: crop and record offsets. Empty tiles get a 1x1 background
+    # placeholder at (0, 0) so no tile is ever 0-sized.
+    cropped = []
+    offsets = np.zeros((n, 2), dtype=np.int32)
+    bg_pixel = bg.reshape(1, 1, -1) if arr.ndim == 4 else bg.reshape(1, 1)
+    for i, b in enumerate(bboxes):
+        if b is None:
+            cropped.append(np.broadcast_to(bg_pixel, (1, 1) + arr.shape[3:]).astype(arr.dtype).copy())
+        else:
+            r0, c0, r1, c1 = b
+            cropped.append(arr[i, r0:r1, c0:c1].copy())
+            offsets[i] = (r0, c0)
+
+    # Stage 3: dedup cropped tiles and write the tile table.
+    unique_tiles: list = []
+    ids: dict = {}
+    table = np.zeros((n, 3), dtype=np.int32)
+    for i, crop in enumerate(cropped):
+        key = (crop.shape, crop.tobytes())
+        tile_id = ids.get(key)
+        if tile_id is None:
+            tile_id = len(unique_tiles)
+            ids[key] = tile_id
+            unique_tiles.append(crop)
+        table[i] = (tile_id, offsets[i, 0], offsets[i, 1])
+
+    return TrimmedAtlas(
+        tiles=unique_tiles,
+        table=table,
+        empty=empty,
+        tile_size=(h, w),
+        background=tuple(int(v) for v in bg),
+        threshold=float(threshold),
+        per_tile=bool(per_tile),
+    )
+
+
+def rebuild_tiles(atlas: TrimmedAtlas) -> np.ndarray:
+    """Reconstruct the source tile stack from a TrimmedAtlas.
+
+    Every tile is pasted back at its recorded offset on a background-filled
+    canvas. At threshold 0 (exact background matching) the result is
+    pixel-identical to the stack passed to ``trim_tiles``; with a positive
+    threshold, near-background pixels are snapped to the exact background.
+    """
+    n = atlas.table.shape[0]
+    h, w = atlas.tile_size
+    sample = atlas.tiles[0]
+    bg = np.asarray(atlas.background, dtype=sample.dtype).reshape(-1)
+    out = np.empty((n, h, w) + sample.shape[2:], dtype=sample.dtype)
+    out[...] = bg  # broadcasts: (1,) for index tiles, (3,) for RGB
+    for i in range(n):
+        tile_id, off_y, off_x = (int(v) for v in atlas.table[i])
+        tile = atlas.tiles[tile_id]
+        th, tw = tile.shape[:2]
+        out[i, off_y : off_y + th, off_x : off_x + tw] = tile
+    return out
+
+
+def trim_gb_image(
+    gb: GBImage, background: int = 0, threshold: float = 0, per_tile: bool = True
+) -> tuple:
+    """Trim a GBImage's pattern tileset; returns (atlas, cell_table).
+
+    Patterns are index tiles (values 0-3); ``background`` is the background
+    palette index (0 = lightest slot by the luminance-sort convention).
+    ``cell_table`` is a (th, tw, 3) int32 array aligned with ``gb.tilemap``:
+    each map cell's (tile_id, off_y, off_x) -- the tile table with the trim
+    offsets written in. Rebuilding ``atlas`` and indexing it with
+    ``gb.tilemap`` reproduces ``gb.patterns[gb.tilemap]`` exactly at
+    threshold 0.
+    """
+    atlas = trim_tiles(
+        np.asarray(gb.patterns),
+        background=np.asarray([background], dtype=np.int16),
+        threshold=threshold,
+        per_tile=per_tile,
+    )
+    th, tw = gb.tilemap.shape
+    cell_table = atlas.table[gb.tilemap.reshape(-1)].reshape(th, tw, 3)
+    return atlas, cell_table
